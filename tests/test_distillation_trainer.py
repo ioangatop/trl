@@ -55,7 +55,7 @@ def multiply_tool(a: int, b: int) -> int:
 
 
 if is_peft_available():
-    from peft import LoraConfig, PrefixTuningConfig, get_peft_model
+    from peft import LoraConfig, PeftModel, PrefixTuningConfig, PromptTuningConfig, get_peft_model
 
 
 def _reference_chunked_divergence(
@@ -1365,8 +1365,88 @@ class TestDistillationTrainer(TrlTestCase):
             )
 
     @require_peft
+    def test_train_prompt_tuning(self):
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_only", split="train[:2]")
+        student_id = "trl-internal-testing/tiny-Qwen3ForCausalLM"
+        trainer = DistillationTrainer(
+            model=student_id,
+            teacher_model="trl-internal-testing/small-Qwen3ForCausalLM",
+            args=DistillationConfig(
+                output_dir=self.tmp_dir,
+                max_steps=1,
+                per_device_train_batch_size=1,
+                max_completion_length=8,
+                learning_rate=0.1,
+                report_to="none",
+            ),
+            train_dataset=dataset,
+            peft_config=PromptTuningConfig(num_virtual_tokens=4, task_type="CAUSAL_LM"),
+        )
+        original_parameters = {name: param.detach().clone() for name, param in trainer.model.named_parameters()}
+
+        trainer.train()
+
+        assert trainer.state.global_step == 1
+        updated_parameters = {
+            name
+            for name, param in trainer.model.named_parameters()
+            if not torch.equal(param, original_parameters[name])
+        }
+        assert updated_parameters == {"prompt_encoder.default.embedding.weight"}
+
+        trainer.save_model()
+        reloaded = PeftModel.from_pretrained(AutoModelForCausalLM.from_pretrained(student_id), self.tmp_dir)
+        torch.testing.assert_close(
+            reloaded.get_prompt(batch_size=1).detach().cpu(),
+            trainer.model.get_prompt(batch_size=1).detach().cpu(),
+            rtol=0,
+            atol=0,
+        )
+
+    @require_peft
+    def test_prompt_tuning_loss_with_unequal_completion_lengths(self):
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_only", split="train[:2]")
+        trainer = DistillationTrainer(
+            model="trl-internal-testing/tiny-Qwen3ForCausalLM",
+            teacher_model="trl-internal-testing/small-Qwen3ForCausalLM",
+            args=DistillationConfig(output_dir=self.tmp_dir, beta=0.0, bf16=False, report_to="none"),
+            train_dataset=dataset,
+            peft_config=PromptTuningConfig(num_virtual_tokens=4, task_type="CAUSAL_LM"),
+        )
+        student = trainer.model.eval()
+        teacher = trainer.teacher_model.eval()
+        prompt_ids = torch.tensor([[10, 11], [20, 21]], device=trainer.accelerator.device)
+        pad_id = trainer.processing_class.pad_token_id
+        completion_ids = prompt_ids.new_tensor([[12, pad_id], [22, 23]])
+        completion_mask = prompt_ids.new_tensor([[1, 0], [1, 1]])
+
+        with torch.no_grad():
+            batch_loss = trainer.compute_loss(
+                student,
+                {
+                    "prompt_ids": prompt_ids,
+                    "prompt_mask": torch.ones_like(prompt_ids),
+                    "completion_ids": completion_ids,
+                    "completion_mask": completion_mask,
+                },
+            )
+
+            # Score each real answer token from its own unpadded prefix, through PEFT's regular forward.
+            token_losses = []
+            for row, position in completion_mask.nonzero().tolist():
+                prefix = torch.cat((prompt_ids[row], completion_ids[row, :position])).unsqueeze(0)
+                mask = torch.ones_like(prefix)
+                student_logits = student(prefix, attention_mask=mask, use_cache=False).logits[:, -1].float()
+                teacher_logits = teacher(prefix, attention_mask=mask, use_cache=False).logits[:, -1].float()
+                token_losses.append(
+                    F.kl_div(student_logits.log_softmax(-1), teacher_logits.softmax(-1), reduction="batchmean")
+                )
+
+        torch.testing.assert_close(batch_loss, torch.stack(token_losses).mean(), atol=1e-5, rtol=1e-4)
+
+    @require_peft
     def test_peft_prompt_learning_raises(self):
-        # Prompt-learning injects virtual tokens via `PeftModel.forward()`, which the backbone-direct loss bypasses.
+        # Prefix tuning injects cached attention keys and values, which the backbone-direct loss does not prepare.
         dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_only", split="train")
         with pytest.raises(ValueError, match="Prompt-learning"):
             DistillationTrainer(

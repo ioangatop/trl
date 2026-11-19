@@ -87,7 +87,7 @@ from .utils import (
 
 if is_peft_available():
     import peft
-    from peft import LoraConfig, PeftConfig, PeftModel, PromptLearningConfig, get_peft_model
+    from peft import LoraConfig, PeftConfig, PeftModel, PromptLearningConfig, PromptTuningConfig, get_peft_model
     from peft.tuners.tuners_utils import BaseTunerLayer
 
 
@@ -292,7 +292,8 @@ class DistillationTrainer(_BaseTrainer):
             Quantization configuration used when loading the model from a model identifier. Combine with `peft_config`
             for QLoRA training. Ignored if the model is already instantiated.
         peft_config ([`~peft.PeftConfig`], *optional*):
-            PEFT configuration used to wrap the model. If `None`, the model is not wrapped.
+            PEFT configuration used to wrap the model. If `None`, the model is not wrapped. Prompt tuning requires a
+            text student, Transformers generation, and a local teacher model.
         tools (list of `Callable`, *optional*):
             A list of callable tool functions that the model can invoke during generation. Each tool should be a
             standard Python function with properly type-hinted arguments and return values, and a Google-style
@@ -531,13 +532,8 @@ class DistillationTrainer(_BaseTrainer):
             get_peft_model_kwargs = {}
             if args.deepspeed_plugin is not None and args.deepspeed_plugin.zero_stage == 3 and not _is_quantized_model:
                 get_peft_model_kwargs["autocast_adapter_dtype"] = False
-            if isinstance(peft_config, PromptLearningConfig):
-                raise ValueError(
-                    "Prompt-learning PEFT methods (PromptTuning, PrefixTuning, P-Tuning) are not supported. The "
-                    "distillation loss bypasses `PeftModel.forward()` by calling the backbone directly, so virtual "
-                    "tokens are never prepended and the loss is computed on the wrong sequence. Use a weight-based "
-                    "adapter such as LoRA instead."
-                )
+            if isinstance(peft_config, PromptLearningConfig) and not isinstance(peft_config, PromptTuningConfig):
+                raise ValueError("Prompt-learning PEFT methods other than PromptTuning are not supported.")
             # With transformers v5, peft<0.19 doesn't apply `target_modules` to the fused MoE routed experts (#7765)
             if (
                 isinstance(peft_config, LoraConfig)
@@ -645,15 +641,25 @@ class DistillationTrainer(_BaseTrainer):
                     "`lm_head.weight` directly, so the adapter on the head is ignored and never trained. Remove "
                     "`'lm_head'` from your `target_modules`."
                 )
-            # Prompt-learning methods (PromptTuning, PrefixTuning, P-Tuning) inject virtual tokens via
-            # `PeftModel.forward()`, which the loss bypasses by calling the backbone directly, so virtual tokens are
-            # never prepended and the loss is computed on the wrong sequence.
-            if any(isinstance(cfg, PromptLearningConfig) for cfg in model.peft_config.values()):
+            # Prompt-learning methods (PrefixTuning, P-Tuning) inject virtual tokens via
+            # PeftModel.forward(), which the distillation loss bypasses by calling the backbone
+            # directly. This results in missing virtual tokens and an incorrect loss sequence.
+            # Only PromptTuning is supported for distillation.
+            if any(
+                isinstance(cfg, PromptLearningConfig) and not isinstance(cfg, PromptTuningConfig)
+                for cfg in model.peft_config.values()
+            ):
                 raise ValueError(
-                    "Prompt-learning PEFT methods (PromptTuning, PrefixTuning, P-Tuning) are not supported. The "
-                    "distillation loss bypasses `PeftModel.forward()` by calling the backbone directly, so virtual "
-                    "tokens are never prepended and the loss is computed on the wrong sequence. Use a weight-based "
-                    "adapter such as LoRA instead."
+                    "Prompt-learning PEFT methods (PrefixTuning, P-Tuning) other than PromptTuning are not supported. "
+                    "The distillation loss bypasses `PeftModel.forward()` by calling the backbone directly, "
+                    "so virtual tokens are not prepended and the loss is computed on the wrong sequence. "
+                    "Use a weight-based adapter such as LoRA instead."
+                )
+            if isinstance(model.active_peft_config, PromptTuningConfig) and (
+                self._is_vlm or args.use_vllm or teacher_model is None
+            ):
+                raise ValueError(
+                    "PromptTuning requires a text student, Transformers generation, and a local teacher model."
                 )
 
         # The chunked JSD loss calls the student backbone directly, bypassing the DDP/FSDP wrapper's forward; route it
@@ -1549,11 +1555,20 @@ class DistillationTrainer(_BaseTrainer):
         mm_token_type_ids=None,
         image_position_ids=None,
     ):
-        if is_peft_model(unwrapped_model):
-            unwrapped_model = unwrapped_model.base_model.model
-
         # Build model inputs - check if the model supports logits_to_keep (some models and VLMs don't)
         model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
+
+        if is_peft_model(unwrapped_model):
+            if isinstance(unwrapped_model.active_peft_config, PromptTuningConfig):
+                # The backbone call skips PEFT's forward, so prepend the soft prompt and its mask here.
+                inputs_embeds = unwrapped_model.get_input_embeddings()(input_ids)
+                prompts = unwrapped_model.get_prompt(batch_size=input_ids.size(0)).to(inputs_embeds)
+                prefix_mask = attention_mask.new_ones(prompts.shape[:2])
+                model_inputs.pop("input_ids")
+                model_inputs["inputs_embeds"] = torch.cat((prompts, inputs_embeds), dim=1)
+                model_inputs["attention_mask"] = torch.cat((prefix_mask, attention_mask), dim=1)
+
+            unwrapped_model = unwrapped_model.get_base_model()
 
         # For Qwen models:
         if image_grid_thw is not None and pixel_values is not None:
